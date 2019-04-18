@@ -18,6 +18,7 @@
 #include "AT_CellularContext.h"
 #include "AT_CellularNetwork.h"
 #include "AT_CellularStack.h"
+#include "AT_CellularDevice.h"
 #include "CellularLog.h"
 #include "CellularUtil.h"
 #if (DEVICE_SERIAL && DEVICE_INTERRUPTIN) || defined(DOXYGEN_ONLY)
@@ -47,8 +48,8 @@ using namespace mbed_cellular_util;
 using namespace mbed;
 
 AT_CellularContext::AT_CellularContext(ATHandler &at, CellularDevice *device, const char *apn, bool cp_req, bool nonip_req) :
-    AT_CellularBase(at), _is_connected(false), _is_blocking(true),
-    _current_op(OP_INVALID), _device(device), _nw(0), _fh(0), _cp_req(cp_req), _nonip_req(nonip_req), _cp_in_use(false)
+    AT_CellularBase(at), _is_connected(false), _current_op(OP_INVALID), _fh(0), _cp_req(cp_req),
+    _nonip_req(nonip_req), _cp_in_use(false)
 {
     tr_info("New CellularContext %s (%p)", apn ? apn : "", this);
     _stack = NULL;
@@ -67,6 +68,12 @@ AT_CellularContext::AT_CellularContext(ATHandler &at, CellularDevice *device, co
     _dcd_pin = NC;
     _active_high = false;
     _cp_netif = NULL;
+    memset(_retry_timeout_array, 0, CELLULAR_RETRY_ARRAY_SIZE);
+    _retry_array_length = 0;
+    _retry_count = 0;
+    _is_blocking = true;
+    _device = device;
+    _nw = NULL;
 }
 
 AT_CellularContext::~AT_CellularContext()
@@ -112,6 +119,16 @@ void AT_CellularContext::enable_hup(bool enable)
     }
 }
 
+AT_CellularDevice *AT_CellularContext::get_device() const
+{
+    return static_cast<AT_CellularDevice *>(CellularContext::get_device());
+}
+
+void AT_CellularContext::do_connect_with_retry()
+{
+    CellularContext::do_connect_with_retry();
+}
+
 nsapi_error_t AT_CellularContext::connect()
 {
     tr_info("CellularContext connect");
@@ -122,15 +139,15 @@ nsapi_error_t AT_CellularContext::connect()
 
     nsapi_error_t err = _device->attach_to_network();
     _cb_data.error = check_operation(err, OP_CONNECT);
-
+    _retry_count = 0;
     if (_is_blocking) {
         if (_cb_data.error == NSAPI_ERROR_OK || _cb_data.error == NSAPI_ERROR_ALREADY) {
-            do_connect();
+            do_connect_with_retry();
         }
     } else {
         if (_cb_data.error == NSAPI_ERROR_ALREADY) {
             // device is already attached, to be async we must use queue to connect and give proper callbacks
-            int id = _device->get_queue()->call_in(0, this, &AT_CellularContext::do_connect);
+            int id = _device->get_queue()->call_in(0, this, &AT_CellularContext::do_connect_with_retry);
             if (id == 0) {
                 return NSAPI_ERROR_NO_MEMORY;
             }
@@ -179,7 +196,7 @@ nsapi_error_t AT_CellularContext::check_operation(nsapi_error_t err, ContextOper
                 tr_warning("No cellular connection");
                 return NSAPI_ERROR_TIMEOUT;
             }
-            return NSAPI_ERROR_OK;
+            return _cb_data.error;// callback might have been completed with an error, must return that error here
         }
     }
 
@@ -573,8 +590,6 @@ void AT_CellularContext::do_connect()
         _cb_data.error = open_data_channel();
         _at.unlock();
         if (_cb_data.error != NSAPI_ERROR_OK) {
-            tr_error("Failed to open data channel!");
-            call_network_cb(NSAPI_STATUS_DISCONNECTED);
             _is_connected = false;
         } else {
             _is_context_activated = true;
@@ -672,6 +687,10 @@ nsapi_error_t AT_CellularContext::disconnect()
 {
     tr_info("CellularContext disconnect()");
     if (!_nw || !_is_connected) {
+        if (_new_context_set) {
+            delete_current_context();
+        }
+        _cid = -1;
         return NSAPI_ERROR_NO_CONNECTION;
     }
 
@@ -700,6 +719,11 @@ nsapi_error_t AT_CellularContext::disconnect()
 
     // call device's callback, it will broadcast this to here (cellular_callback)
     _device->cellular_callback(NSAPI_EVENT_CONNECTION_STATUS_CHANGE, NSAPI_STATUS_DISCONNECTED, this);
+
+    if (_new_context_set) {
+        delete_current_context();
+    }
+    _cid = -1;
 
     return _at.unlock_return_error();
 }
@@ -888,6 +912,12 @@ void AT_CellularContext::cellular_callback(nsapi_event_t ev, intptr_t ptr)
         cell_callback_data_t *data = (cell_callback_data_t *)ptr;
         cellular_connection_status_t st = (cellular_connection_status_t)ev;
         _cb_data.error = data->error;
+        _cb_data.final_try = data->final_try;
+        if (data->final_try) {
+            if (_current_op != OP_INVALID) {
+                _semaphore.release();
+            }
+        }
 #if USE_APN_LOOKUP
         if (st == CellularSIMStatusChanged && data->status_data == CellularDevice::SimStateReady &&
                 _cb_data.error == NSAPI_ERROR_OK) {
@@ -909,7 +939,9 @@ void AT_CellularContext::cellular_callback(nsapi_event_t ev, intptr_t ptr)
                     _device->stop();
                     if (_is_blocking) {
                         // operation failed, release semaphore
-                        _semaphore.release();
+                        if (_current_op != OP_INVALID) {
+                            _semaphore.release();
+                        }
                     }
                 }
                 _device->close_information();
@@ -917,11 +949,11 @@ void AT_CellularContext::cellular_callback(nsapi_event_t ev, intptr_t ptr)
         }
 #endif // USE_APN_LOOKUP
 
-        if (!_nw && st == CellularDeviceReady && data->error == NSAPI_ERROR_OK) {
+        if (!_nw && st == CellularDeviceReady && _cb_data.error == NSAPI_ERROR_OK) {
             _nw = _device->open_network(_fh);
         }
 
-        if (_cp_req && !_cp_in_use && (data->error == NSAPI_ERROR_OK) &&
+        if (_cp_req && !_cp_in_use && (_cb_data.error == NSAPI_ERROR_OK) &&
                 (st == CellularSIMStatusChanged && data->status_data == CellularDevice::SimStateReady)) {
             if (setup_control_plane_opt() != NSAPI_ERROR_OK) {
                 tr_error("Control plane SETUP failed!");
@@ -931,10 +963,12 @@ void AT_CellularContext::cellular_callback(nsapi_event_t ev, intptr_t ptr)
         }
 
         if (_is_blocking) {
-            if (data->error != NSAPI_ERROR_OK) {
+            if (_cb_data.error != NSAPI_ERROR_OK) {
                 // operation failed, release semaphore
-                _current_op = OP_INVALID;
-                _semaphore.release();
+                if (_current_op != OP_INVALID) {
+                    _current_op = OP_INVALID;
+                    _semaphore.release();
+                }
             } else {
                 if ((st == CellularDeviceReady && _current_op == OP_DEVICE_READY) ||
                         (st == CellularSIMStatusChanged && _current_op == OP_SIM_READY &&
@@ -956,14 +990,15 @@ void AT_CellularContext::cellular_callback(nsapi_event_t ev, intptr_t ptr)
             }
         } else {
             // non blocking
-            if (st == CellularAttachNetwork && _current_op == OP_CONNECT && data->error == NSAPI_ERROR_OK &&
+            if (st == CellularAttachNetwork && _current_op == OP_CONNECT && _cb_data.error == NSAPI_ERROR_OK &&
                     data->status_data == CellularNetwork::Attached) {
                 _current_op = OP_INVALID;
                 // forward to application
                 if (_status_cb) {
                     _status_cb(ev, ptr);
                 }
-                do_connect();
+                _retry_count = 0;
+                do_connect_with_retry();
                 return;
             }
         }
@@ -990,19 +1025,6 @@ void AT_CellularContext::cellular_callback(nsapi_event_t ev, intptr_t ptr)
     // forward to application
     if (_status_cb) {
         _status_cb(ev, ptr);
-    }
-}
-
-void AT_CellularContext::call_network_cb(nsapi_connection_status_t status)
-{
-    if (_connect_status != status) {
-        _connect_status = status;
-        if (_status_cb) {
-            _status_cb(NSAPI_EVENT_CONNECTION_STATUS_CHANGE, _connect_status);
-        }
-        if (_nw && _connect_status == NSAPI_STATUS_DISCONNECTED) {
-            tr_info("CellularContext disconnected");
-        }
     }
 }
 

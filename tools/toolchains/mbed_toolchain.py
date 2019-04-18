@@ -663,7 +663,10 @@ class mbedToolchain:
         region_list = [r._replace(filename=binary) if r.active else r
                        for r in region_list]
         res = "{}.{}".format(join(self.build_dir, name), ext)
-        merge_region_list(region_list, res, self.notify, self.config)
+        merge_region_list(
+            region_list, res, self.notify,
+            restrict_size=self.config.target.restrict_size
+        )
         update_regions = [
             r for r in region_list if r.name in UPDATE_WHITELIST
         ]
@@ -676,7 +679,7 @@ class mbedToolchain:
                 update_regions,
                 update_res,
                 self.notify,
-                self.config
+                restrict_size=self.config.target.restrict_size
             )
             return res, update_res
         else:
@@ -775,6 +778,7 @@ class mbedToolchain:
         )
         self.notify.debug("Return: %s" % rc)
 
+        self.parse_output(stderr)
         for output_line in stdout.splitlines():
             self.notify.debug("Output: %s" % output_line)
         for error_line in stderr.splitlines():
@@ -840,7 +844,7 @@ class mbedToolchain:
     def _add_all_regions(self, region_list, active_region_name):
         for region in region_list:
             self._add_defines_from_region(region)
-            if region.active:
+            if region.active and active_region_name:
                 for define in [
                         ("%s_START" % active_region_name,
                          "0x%x" % region.start),
@@ -874,7 +878,7 @@ class mbedToolchain:
                     "s" if len(regions) > 1 else "",
                     ", ".join(r.name for r in regions)
                 ))
-                self._add_all_regions(regions, "MBED_RAM")
+                self._add_all_regions(regions, None)
             except ConfigException:
                 pass
 
